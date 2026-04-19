@@ -123,12 +123,11 @@ tr:hover td{background:var(--surface2)}
       <div class="filter-label">部門</div>
       <select id="filter-division">
         <option value="">全部門</option>
-        <option value="直営ベーシック">直営ベーシック</option>
-        <option value="直営ぷれじでんと">直営ぷれじでんと</option>
+        <option value="第1営業部">第1営業部（直営ベーシック＋ららぽーと甲子園）</option>
+        <option value="第2営業部">第2営業部（直営ぷれじでんと＋華恵比寿）</option>
         <option value="FC">FC</option>
         <option value="IZAKAYA">IZAKAYA</option>
         <option value="おでんすみ吉">おでんすみ吉</option>
-        <option value="フードコート（ららぽーと甲子園）">フードコート（ららぽーと甲子園）</option>
       </select>
     </div>
     <div class="filter-group">
@@ -256,9 +255,16 @@ tr:hover td{background:var(--surface2)}
         <input type="file" id="csv-upload2" accept=".csv" multiple>
         <div class="upload-title">クリックしてCSVを選択</div>
         <div class="upload-hint">ShiftJIS / UTF-8 対応 ・ 複数ファイル同時追加OK</div>
-        <div class="upload-hint" style="margin-top:4px">日別売上実績表CSVをドロップまたはクリックして選択</div>
+        <div class="upload-hint" style="margin-top:4px;color:var(--good)">ブラウザに永続保存 — リロードしてもデータは消えません</div>
       </label>
-      <div id="session-files" class="file-list"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">
+        <span>保存済みデータ（月別）</span>
+        <button id="btn-delete-selected" class="btn" style="font-size:11px;color:var(--bad);border-color:var(--bad);display:none">選択した月を削除</button>
+      </div>
+      <div id="month-list" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div id="no-data-msg" style="font-size:13px;color:var(--text2);padding:16px 0;display:none">保存済みデータがありません</div>
     </div>
     <div class="card">
       <div class="card-title">GitHubへの定期更新方法</div>
@@ -279,50 +285,111 @@ tr:hover td{background:var(--surface2)}
 <div class="toast" id="toast"></div>
 
 <script>
-const PRESIDENT_CODES = new Set(['101','102','103','109','111','113','112']);
+const PRESIDENT_CODES = new Set(['101','102','103','109','111','113','112','034']);
 const SUMI_CODES = new Set(['704']);
-const FOOD_COURT_CODES = new Set(['702']);
 
 function getDivision(sc, gyotai) {
   if (gyotai === '千房FC') return 'FC';
   if (gyotai === '千房フロンティア') return 'IZAKAYA';
   if (SUMI_CODES.has(sc)) return 'おでんすみ吉';
-  if (FOOD_COURT_CODES.has(sc)) return 'フードコート（ららぽーと甲子園）';
-  if (PRESIDENT_CODES.has(sc)) return '直営ぷれじでんと';
-  return '直営ベーシック';
+  if (PRESIDENT_CODES.has(sc)) return '第2営業部';
+  return '第1営業部';
 }
 
 let allData = [];
-let sessionFiles = {};
 let charts = {};
 let trendMode = 'daily';
 let storeMode = 'sales';
 
-// ---- utils ----
-const fmt = n => Math.round(n).toLocaleString('ja-JP');
+// ======== IndexedDB ========
+const IDB_NAME = 'sales_db';
+const IDB_VER  = 1;
+let idb = null;
+
+function openIDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VER);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains('records')) d.createObjectStore('records', {keyPath:'_id'});
+      if (!d.objectStoreNames.contains('files'))   d.createObjectStore('files',   {keyPath:'ym'});
+    };
+    req.onsuccess = e => { idb = e.target.result; res(); };
+    req.onerror   = () => rej(req.error);
+  });
+}
+
+function idbPut(storeName, obj) {
+  return new Promise((res, rej) => {
+    const tx = idb.transaction(storeName, 'readwrite');
+    const s  = tx.objectStore(storeName);
+    (Array.isArray(obj) ? obj : [obj]).forEach(o => s.put(o));
+    tx.oncomplete = res;
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+
+function idbGetAll(storeName) {
+  return new Promise((res, rej) => {
+    const tx  = idb.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = () => res(req.result || []);
+    req.onerror   = () => rej(req.error);
+  });
+}
+
+function idbDeleteByYm(ym) {
+  // recordsからym一致を削除、filesからymキーを削除
+  return new Promise((res, rej) => {
+    const tx = idb.transaction(['records','files'], 'readwrite');
+    const rs = tx.objectStore('records');
+    const fs = tx.objectStore('files');
+    // records: getAll して ym一致を削除
+    const req = rs.getAll();
+    req.onsuccess = () => {
+      req.result.forEach(r => { if (r.ym === ym) rs.delete(r._id); });
+      fs.delete(ym);
+    };
+    tx.oncomplete = res;
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+
+function idbClear() {
+  return new Promise((res, rej) => {
+    const tx = idb.transaction(['records','files'], 'readwrite');
+    tx.objectStore('records').clear();
+    tx.objectStore('files').clear();
+    tx.oncomplete = res;
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+
+// ======== utils ========
+const fmt    = n => Math.round(n).toLocaleString('ja-JP');
 const fmtYen = n => '¥' + fmt(n);
-const pct = (a, b) => b ? (a / b * 100).toFixed(1) + '%' : '-';
 const pctNum = (a, b) => b ? a / b * 100 : null;
 function ratioClass(v) { if (!v) return 'neutral'; if (v >= 100) return 'good'; if (v >= 90) return 'warn'; return 'bad'; }
 
-function toast(msg) {
+function toast(msg, type='') {
   const el = document.getElementById('toast');
   el.textContent = msg;
+  el.style.background = type === 'error' ? 'var(--bad)' : '';
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 2500);
+  setTimeout(() => el.classList.remove('show'), 2800);
 }
 
-// ---- filter ----
+// ======== filters ========
 function getFiltered() {
-  const div = document.getElementById('filter-division').value;
+  const div   = document.getElementById('filter-division').value;
   const store = document.getElementById('filter-store').value;
   const month = document.getElementById('filter-month').value;
-  const dow = document.getElementById('filter-dow').value;
+  const dow   = document.getElementById('filter-dow').value;
   return allData.filter(r =>
-    (!div || r.division === div) &&
-    (!store || r.store === store) &&
-    (!month || r.ym === month) &&
-    (!dow || r.dow_type === dow)
+    (!div   || r.division === div) &&
+    (!store || r.store    === store) &&
+    (!month || r.ym       === month) &&
+    (!dow   || r.dow_type === dow)
   );
 }
 
@@ -330,15 +397,15 @@ function updateFilters() {
   const div = document.getElementById('filter-division').value;
   const stores = [...new Set(allData.filter(r => !div || r.division === div).map(r => r.store))].sort();
   const sSel = document.getElementById('filter-store');
-  const curStore = sSel.value;
-  sSel.innerHTML = '<option value="">全店舗</option>' + stores.map(s => `<option value="${s}"${s===curStore?' selected':''}>${s}</option>`).join('');
+  const curS = sSel.value;
+  sSel.innerHTML = '<option value="">全店舗</option>' + stores.map(s => `<option value="${s}"${s===curS?' selected':''}>${s}</option>`).join('');
 
   const months = [...new Set(allData.map(r => r.ym))].filter(Boolean).sort();
   const mSel = document.getElementById('filter-month');
-  const curMonth = mSel.value;
+  const curM = mSel.value;
   mSel.innerHTML = '<option value="">全期間</option>' + months.map(m => {
     const label = m.replace(/^(\d{4})-(\d{2})$/, '$1年$2月');
-    return `<option value="${m}"${m===curMonth?' selected':''}>${label}</option>`;
+    return `<option value="${m}"${m===curM?' selected':''}>${label}</option>`;
   }).join('');
 }
 
@@ -346,11 +413,11 @@ function updateDataRange() {
   const dates = [...new Set(allData.map(r => r.date))].filter(Boolean).sort();
   const el = document.getElementById('data-range');
   if (!dates.length) { el.textContent = 'データなし'; return; }
-  const fmt = d => d.replace(/\//g, '.');
-  el.textContent = `${fmt(dates[0])} 〜 ${fmt(dates[dates.length-1])} ｜ ${dates.length}日分`;
+  const f = d => d.replace(/\//g,'.');
+  el.textContent = `${f(dates[0])} 〜 ${f(dates[dates.length-1])} ｜ ${dates.length}日分`;
 }
 
-// ---- aggregate ----
+// ======== aggregate ========
 function aggregate(data, keyFn) {
   const map = {};
   data.forEach(r => {
@@ -362,10 +429,10 @@ function aggregate(data, keyFn) {
     m.customers += r.customers; m.customers_budget += r.customers_budget; m.customers_prev += r.customers_prev;
     if (r.unit_price > 0) { m.unit_sum += r.unit_price; m.unit_cnt++; }
   });
-  return Object.values(map).sort((a, b) => a.key < b.key ? -1 : 1);
+  return Object.values(map).sort((a,b) => a.key < b.key ? -1 : 1);
 }
 
-// ---- KPI ----
+// ======== KPI ========
 function renderKPI(data) {
   const total = {sales:0,sales_budget:0,sales_prev:0,customers:0,customers_prev:0,unit_sum:0,unit_cnt:0};
   data.forEach(r => {
@@ -373,35 +440,37 @@ function renderKPI(data) {
     total.customers += r.customers; total.customers_prev += r.customers_prev;
     if (r.unit_price>0) { total.unit_sum += r.unit_price; total.unit_cnt++; }
   });
-  const dates = [...new Set(data.map(r=>r.date))].sort();
+  const dates    = [...new Set(data.map(r=>r.date))].sort();
   const lastDate = dates[dates.length-1] || '';
-  const lastDay = data.filter(r => r.date === lastDate);
+  const lastDay  = data.filter(r => r.date === lastDate);
   const lastSales = lastDay.reduce((s,r)=>s+r.sales, 0);
-  const lastPrev = lastDay.reduce((s,r)=>s+r.sales_prev, 0);
-  const lastCust = lastDay.reduce((s,r)=>s+r.customers, 0);
-  const lastCustPrev = lastDay.reduce((s,r)=>s+r.customers_prev, 0);
-  const avgUnit = total.unit_cnt ? Math.round(total.unit_sum / total.unit_cnt) : 0;
-  const sr = pctNum(total.sales, total.sales_prev);
-  const br = pctNum(total.sales, total.sales_budget);
-  const cr = pctNum(total.customers, total.customers_prev);
+  const lastPrev  = lastDay.reduce((s,r)=>s+r.sales_prev, 0);
+  const avgUnit   = total.unit_cnt ? Math.round(total.unit_sum / total.unit_cnt) : 0;
+  const sr  = pctNum(total.sales, total.sales_prev);
+  const br  = pctNum(total.sales, total.sales_budget);
+  const cr  = pctNum(total.customers, total.customers_prev);
   const lsr = pctNum(lastSales, lastPrev);
-  const lcr = pctNum(lastCust, lastCustPrev);
-
+  const filteredStores  = new Set(data.map(r=>r.store));
+  const totalStores     = new Set(allData.map(r=>r.store));
+  const storeCount      = filteredStores.size;
+  const totalStoreCount = totalStores.size;
+  const isFiltered      = storeCount < totalStoreCount;
   const dateLabel = lastDate ? lastDate.replace(/\//g,'.') : '-';
   const kpis = [
-    {label:'最新日売上', val: fmtYen(lastSales), sub: lsr ? `<span class="badge ${ratioClass(lsr)}">前年比 ${lsr.toFixed(1)}%</span>` : `<span class="badge neutral">${dateLabel}</span>`},
-    {label:'累計売上', val: fmtYen(total.sales), sub: `<span style="color:var(--text2);font-size:11px">${dates.length}日分合計</span>`},
+    {label:'最新日売上',    val: fmtYen(lastSales), sub: lsr ? `<span class="badge ${ratioClass(lsr)}">前年比 ${lsr.toFixed(1)}%</span>` : `<span class="badge neutral">${dateLabel}</span>`},
+    {label:'累計売上',      val: fmtYen(total.sales), sub: `<span style="color:var(--text2);font-size:11px">${dates.length}日分合計</span>`},
     {label:'前年比（累計）', val: sr ? `<span class="${ratioClass(sr)}">${sr.toFixed(1)}%</span>` : '-', sub: total.sales_prev ? `<span style="color:var(--text2);font-size:11px">前年 ${fmtYen(total.sales_prev)}</span>` : ''},
     {label:'予算比（累計）', val: br ? `<span class="${ratioClass(br)}">${br.toFixed(1)}%</span>` : '-', sub: total.sales_budget ? `<span style="color:var(--text2);font-size:11px">予算 ${fmtYen(total.sales_budget)}</span>` : ''},
-    {label:'累計客数', val: fmt(total.customers), sub: cr ? `<span class="badge ${ratioClass(cr)}">前年比 ${cr.toFixed(1)}%</span>` : ''},
-    {label:'最新日客単価', val: fmtYen(lastDay.filter(r=>r.unit_price>0).reduce((s,r,_,a)=>s+r.unit_price/a.length,0) || avgUnit), sub: `<span style="color:var(--text2);font-size:11px">平均 ${fmtYen(avgUnit)}</span>`},
+    {label:'累計客数',      val: fmt(total.customers), sub: cr ? `<span class="badge ${ratioClass(cr)}">前年比 ${cr.toFixed(1)}%</span>` : ''},
+    {label:'最新日客単価',  val: fmtYen(lastDay.filter(r=>r.unit_price>0).reduce((s,r,_,a)=>s+r.unit_price/a.length,0)||avgUnit), sub: `<span style="color:var(--text2);font-size:11px">平均 ${fmtYen(avgUnit)}</span>`},
+    {label:'対象店舗数',    val: `${storeCount}<span style="font-size:14px;font-weight:400;color:var(--text2)"> 店</span>`, sub: isFiltered ? `<span style="color:var(--text2);font-size:11px">全${totalStoreCount}店舗中</span>` : `<span style="color:var(--text2);font-size:11px">全店舗（${totalStoreCount}店）</span>`},
   ];
   document.getElementById('kpi-grid').innerHTML = kpis.map(k =>
     `<div class="kpi"><div class="kpi-label">${k.label}</div><div class="kpi-value">${k.val}</div><div class="kpi-sub">${k.sub||''}</div></div>`
   ).join('');
 }
 
-// ---- chart helpers ----
+// ======== chart helpers ========
 function destroyChart(id) { if(charts[id]) { try{charts[id].destroy()}catch(e){} delete charts[id]; } }
 
 function lineChart(id, labels, datasets, opts={}) {
@@ -413,12 +482,7 @@ function lineChart(id, labels, datasets, opts={}) {
     data: { labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: {
-        callbacks: { label: ctx => {
-          const v = ctx.raw;
-          return opts.yen ? ' ¥'+Math.round(v).toLocaleString() : ' '+Math.round(v).toLocaleString();
-        }}
-      }},
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => opts.yen ? ' ¥'+Math.round(c.raw).toLocaleString() : ' '+Math.round(c.raw).toLocaleString() }}},
       scales: {
         x: { ticks: { font:{size:10}, color:'#888780', maxTicksLimit: opts.maxX||14, autoSkip:true }, grid: { display:false }},
         y: { ticks: { font:{size:10}, color:'#888780', callback: v => opts.yen ? '¥'+Math.round(v/10000)+'万' : v.toLocaleString() }, grid: { color:'rgba(136,135,128,0.1)' }}
@@ -446,129 +510,109 @@ function barChartH(id, labels, data, colors) {
   });
 }
 
-// ---- weekly key ----
 function weekKey(dateStr) {
-  const d = new Date(dateStr.replace(/\//g,'-'));
+  const d   = new Date(dateStr.replace(/\//g,'-'));
   const day = d.getDay();
   const mon = new Date(d);
   mon.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
-  return mon.toISOString().substring(0, 10);
+  return mon.toISOString().substring(0,10);
 }
 
-// ---- render summary ----
+// ======== render summary ========
 function renderSummary(data) {
   renderKPI(data);
-  const agg = aggregate(data, r => r.date);
+  const agg    = aggregate(data, r => r.date);
   const labels = agg.map(a => a.key.replace('2026/','').replace(/^0/,''));
   lineChart('chart-main', labels, [
-    {label:'実績',data:agg.map(a=>a.sales),borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',tension:0.3,fill:true,borderWidth:2},
-    {label:'前年',data:agg.map(a=>a.sales_prev),borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,fill:false,borderWidth:1.5},
+    {label:'実績',data:agg.map(a=>a.sales),       borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',tension:0.3,fill:true, borderWidth:2},
+    {label:'前年',data:agg.map(a=>a.sales_prev),  borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,fill:false,borderWidth:1.5},
     {label:'予算',data:agg.map(a=>a.sales_budget),borderColor:'#639922',borderDash:[3,3],tension:0.3,fill:false,borderWidth:1.5},
   ], {yen:true});
   lineChart('chart-cust', labels, [
-    {label:'客数',data:agg.map(a=>a.customers),borderColor:'#378ADD',tension:0.3,borderWidth:2},
-    {label:'前年',data:agg.map(a=>a.customers_prev),borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,borderWidth:1.5},
+    {label:'客数',data:agg.map(a=>a.customers),      borderColor:'#378ADD',tension:0.3,borderWidth:2},
+    {label:'前年',data:agg.map(a=>a.customers_prev), borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,borderWidth:1.5},
   ], {noPoint:true});
   lineChart('chart-unit', labels, [
     {label:'客単価',data:agg.map(a=>a.unit_cnt?Math.round(a.unit_sum/a.unit_cnt):0),borderColor:'#1D9E75',tension:0.3,borderWidth:2},
   ], {noPoint:true});
 }
 
-// ---- render trend ----
+// ======== render trend ========
 function renderTrend(data) {
   const keyFn = trendMode === 'monthly' ? r => r.ym :
                 trendMode === 'weekly'  ? r => weekKey(r.date) : r => r.date;
-  const agg = aggregate(data, keyFn);
+  const agg    = aggregate(data, keyFn);
   const labels = agg.map(a => {
-    if (trendMode === 'monthly') return a.key.replace(/^20\d{2}-/, '') + '月';
-    if (trendMode === 'weekly')  return a.key.replace(/^\d{4}-/, '').replace('-','/') + '週';
-    return a.key.replace('2026/','').replace(/^0/,'');
+    if (trendMode === 'monthly') return a.key.replace(/^\d{4}-/,'') + '月';
+    if (trendMode === 'weekly')  return a.key.replace(/^\d{4}-/,'').replace('-','/') + '週';
+    return a.key.replace(/^\d{4}\//,'').replace(/^0/,'');
   });
   document.getElementById('trend-title').textContent = {daily:'日次',weekly:'週次',monthly:'月次'}[trendMode] + '売上推移';
   lineChart('chart-trend', labels, [
-    {label:'実績',data:agg.map(a=>a.sales),borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',tension:0.3,fill:true,borderWidth:2},
-    {label:'前年',data:agg.map(a=>a.sales_prev),borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,fill:false,borderWidth:1.5},
+    {label:'実績',data:agg.map(a=>a.sales),       borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',tension:0.3,fill:true, borderWidth:2},
+    {label:'前年',data:agg.map(a=>a.sales_prev),  borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,fill:false,borderWidth:1.5},
     {label:'予算',data:agg.map(a=>a.sales_budget),borderColor:'#639922',borderDash:[3,3],tension:0.3,fill:false,borderWidth:1.5},
   ], {yen:true, maxX:20});
   lineChart('chart-trend-c', labels, [
-    {label:'客数',data:agg.map(a=>a.customers),borderColor:'#378ADD',tension:0.3,borderWidth:2},
-    {label:'前年',data:agg.map(a=>a.customers_prev),borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,borderWidth:1.5},
+    {label:'客数',data:agg.map(a=>a.customers),      borderColor:'#378ADD',tension:0.3,borderWidth:2},
+    {label:'前年',data:agg.map(a=>a.customers_prev), borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,borderWidth:1.5},
   ], {noPoint:true, maxX:20});
   lineChart('chart-trend-u', labels, [
     {label:'客単価',data:agg.map(a=>a.unit_cnt?Math.round(a.unit_sum/a.unit_cnt):0),borderColor:'#1D9E75',tension:0.3,borderWidth:2},
   ], {noPoint:true, maxX:20});
 }
 
-// ---- render store ----
+// ======== render store ========
 function renderStore(data) {
   const byStore = aggregate(data, r => r.store);
   byStore.forEach(s => { const d = data.find(r=>r.store===s.key); s.division = d?d.division:''; });
-
   let sorted;
-  if (storeMode === 'ratio')    sorted = [...byStore].filter(s=>s.sales_prev>0).sort((a,b)=>b.sales/b.sales_prev-a.sales/a.sales_prev);
-  else if (storeMode === 'budget') sorted = [...byStore].filter(s=>s.sales_budget>0).sort((a,b)=>b.sales/b.sales_budget-a.sales/a.sales_budget);
+  if      (storeMode === 'ratio')     sorted = [...byStore].filter(s=>s.sales_prev>0).sort((a,b)=>b.sales/b.sales_prev-a.sales/a.sales_prev);
+  else if (storeMode === 'budget')    sorted = [...byStore].filter(s=>s.sales_budget>0).sort((a,b)=>b.sales/b.sales_budget-a.sales/a.sales_budget);
   else if (storeMode === 'customers') sorted = [...byStore].sort((a,b)=>b.customers-a.customers);
-  else if (storeMode === 'unit') sorted = [...byStore].filter(s=>s.unit_cnt>0).sort((a,b)=>(b.unit_sum/b.unit_cnt)-(a.unit_sum/a.unit_cnt));
-  else sorted = [...byStore].sort((a,b)=>b.sales-a.sales);
-
-  const top = sorted.slice(0, 25);
-  const labels = top.map(s => s.key.length > 10 ? s.key.substring(0,10)+'…' : s.key);
+  else if (storeMode === 'unit')      sorted = [...byStore].filter(s=>s.unit_cnt>0).sort((a,b)=>(b.unit_sum/b.unit_cnt)-(a.unit_sum/a.unit_cnt));
+  else                                sorted = [...byStore].sort((a,b)=>b.sales-a.sales);
+  const top    = sorted.slice(0,25);
+  const labels = top.map(s => s.key.length>10 ? s.key.substring(0,10)+'…' : s.key);
   let vals, colors;
-  if (storeMode === 'ratio') {
-    vals = top.map(s => Math.round(s.sales/s.sales_prev*100));
-    colors = vals.map(v => v>=100?'#1D9E75':v>=90?'#BA7517':'#D85A30');
-  } else if (storeMode === 'budget') {
-    vals = top.map(s => Math.round(s.sales/s.sales_budget*100));
-    colors = vals.map(v => v>=100?'#1D9E75':v>=90?'#BA7517':'#D85A30');
-  } else if (storeMode === 'customers') {
-    vals = top.map(s => s.customers);
-    colors = top.map(() => '#5DCAA5');
-  } else if (storeMode === 'unit') {
-    vals = top.map(s => Math.round(s.unit_sum/s.unit_cnt));
-    colors = top.map(() => '#7F77DD');
-  } else {
-    vals = top.map(s => s.sales);
-    colors = top.map(() => '#378ADD');
-  }
-
+  if      (storeMode === 'ratio')     { vals=top.map(s=>Math.round(s.sales/s.sales_prev*100));   colors=vals.map(v=>v>=100?'#1D9E75':v>=90?'#BA7517':'#D85A30'); }
+  else if (storeMode === 'budget')    { vals=top.map(s=>Math.round(s.sales/s.sales_budget*100)); colors=vals.map(v=>v>=100?'#1D9E75':v>=90?'#BA7517':'#D85A30'); }
+  else if (storeMode === 'customers') { vals=top.map(s=>s.customers); colors=top.map(()=>'#5DCAA5'); }
+  else if (storeMode === 'unit')      { vals=top.map(s=>Math.round(s.unit_sum/s.unit_cnt));  colors=top.map(()=>'#7F77DD'); }
+  else                                { vals=top.map(s=>s.sales); colors=top.map(()=>'#378ADD'); }
   const wrap = document.getElementById('store-chart-wrap');
-  const h = Math.max(280, top.length * 30 + 60);
+  const h    = Math.max(280, top.length*30+60);
   wrap.innerHTML = `<div style="position:relative;width:100%;height:${h}px"><canvas id="chart-store" role="img" aria-label="店舗別グラフ">店舗別データ</canvas></div>`;
   barChartH('chart-store', labels, vals, colors);
-
   document.getElementById('store-tbody').innerHTML = sorted.map(s => {
-    const sr = s.sales_prev ? Math.round(s.sales/s.sales_prev*100) : null;
-    const br = s.sales_budget ? Math.round(s.sales/s.sales_budget*100) : null;
-    const unit = s.unit_cnt ? Math.round(s.unit_sum/s.unit_cnt) : 0;
-    return `<tr>
-      <td>${s.key}</td>
-      <td>${s.division}</td>
-      <td>${fmtYen(s.sales)}</td>
-      <td class="${ratioClass(sr)}">${sr?sr+'%':'-'}</td>
-      <td class="${ratioClass(br)}">${br?br+'%':'-'}</td>
-      <td>${fmt(s.customers)}</td>
-      <td>${unit?fmtYen(unit):'-'}</td>
-    </tr>`;
+    const sr   = s.sales_prev   ? Math.round(s.sales/s.sales_prev*100)   : null;
+    const br   = s.sales_budget ? Math.round(s.sales/s.sales_budget*100) : null;
+    const unit = s.unit_cnt     ? Math.round(s.unit_sum/s.unit_cnt)      : 0;
+    return `<tr><td>${s.key}</td><td>${s.division}</td><td>${fmtYen(s.sales)}</td><td class="${ratioClass(sr)}">${sr?sr+'%':'-'}</td><td class="${ratioClass(br)}">${br?br+'%':'-'}</td><td>${fmt(s.customers)}</td><td>${unit?fmtYen(unit):'-'}</td></tr>`;
   }).join('');
 }
 
-// ---- update all ----
+// ======== update all ========
 function updateAll() {
   const data = getFiltered();
-  const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-  if (activeTab === 'summary') renderSummary(data);
-  else if (activeTab === 'trend') renderTrend(data);
-  else if (activeTab === 'store') renderStore(data);
+  const tab  = document.querySelector('.tab.active')?.dataset.tab;
+  if      (tab === 'summary') renderSummary(data);
+  else if (tab === 'trend')   renderTrend(data);
+  else if (tab === 'store')   renderStore(data);
+  else if (tab === 'upload')  renderMonthList();
 }
 
-// ---- CSV parse ----
+// ======== CSV parse ========
 function parseCSV(text) {
-  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').trim().split('\n');
+  const lines = text.replace(/
+/g,'
+').replace(//g,'
+').trim().split('
+');
   if (!lines.length) return [];
   const headers = lines[0].split(',').map(h=>h.trim());
   return lines.slice(1).map(line => {
-    const vals = line.split(',');
-    const obj = {};
+    const vals = line.split(','), obj = {};
     headers.forEach((h,i) => obj[h] = (vals[i]||'').trim());
     return obj;
   }).filter(r => r['営業日'] && r['売上分類'] === '計');
@@ -576,63 +620,137 @@ function parseCSV(text) {
 
 function csvToRecord(r) {
   const sc = (r['店舗コード']||'').trim();
-  const gyotai = (r['業態名称']||'').trim();
+  const gy = (r['業態名称']||'').trim();
+  const dt = r['営業日'];
   return {
-    date: r['営業日'], ym: r['営業日']?.substring(0,7)||'',
+    _id: `${dt}_${sc}`,
+    date: dt, ym: dt?.substring(0,7)||'',
     dow: r['曜日'], dow_type: r['曜日区分'],
-    gyotai, store_code: sc,
+    gyotai: gy, store_code: sc,
     store: (r['店舗名称']||'').trim(),
-    division: getDivision(sc, gyotai),
-    sales: parseFloat(r['売上実績'])||0,
-    sales_budget: parseFloat(r['売上月次予算'])||0,
-    sales_prev: parseFloat(r['売上前年'])||0,
-    customers: parseFloat(r['客数実績'])||0,
+    division: getDivision(sc, gy),
+    sales:            parseFloat(r['売上実績'])||0,
+    sales_budget:     parseFloat(r['売上月次予算'])||0,
+    sales_prev:       parseFloat(r['売上前年'])||0,
+    customers:        parseFloat(r['客数実績'])||0,
     customers_budget: parseFloat(r['客数月次予算'])||0,
-    customers_prev: parseFloat(r['客数前年'])||0,
-    unit_price: parseFloat(r['客数客単価'])||0,
+    customers_prev:   parseFloat(r['客数前年'])||0,
+    unit_price:       parseFloat(r['客数客単価'])||0,
   };
 }
 
 async function readFileSJIS(file) {
   const buf = await file.arrayBuffer();
-  try { return new TextDecoder('shift-jis').decode(buf); } catch(e) {}
-  try { return new TextDecoder('utf-8').decode(buf); } catch(e) {}
-  return new TextDecoder('utf-8', {fatal:false}).decode(buf);
+  for (const enc of ['shift-jis','utf-8']) {
+    try { return new TextDecoder(enc).decode(buf); } catch(e) {}
+  }
+  return new TextDecoder('utf-8',{fatal:false}).decode(buf);
 }
 
-function mergeRecords(newRecords) {
-  const keySet = new Set(newRecords.map(r => `${r.date}_${r.store_code}`));
-  allData = allData.filter(r => !keySet.has(`${r.date}_${r.store_code}`));
-  allData = [...allData, ...newRecords];
+// ======== merge & persist ========
+function mergeIntoAllData(records) {
+  const keySet = new Set(records.map(r => r._id));
+  allData = allData.filter(r => !keySet.has(r._id));
+  allData = [...allData, ...records];
 }
 
 async function handleFiles(files) {
   let total = 0;
+  const ymCounts = {};
   for (const file of files) {
-    const text = await readFileSJIS(file);
-    const raw = parseCSV(text);
+    const text    = await readFileSJIS(file);
+    const raw     = parseCSV(text);
     const records = raw.map(csvToRecord);
-    mergeRecords(records);
-    sessionFiles[file.name] = records.length;
+    mergeIntoAllData(records);
+    // IndexedDBに保存
+    await idbPut('records', records);
+    // ファイルメタ記録（ym別）
+    records.forEach(r => { ymCounts[r.ym] = (ymCounts[r.ym]||0) + 1; });
     total += records.length;
   }
+  // files storeに月別集計を保存
+  const existing = await idbGetAll('files');
+  const existMap = Object.fromEntries(existing.map(f=>[f.ym,f]));
+  for (const [ym, cnt] of Object.entries(ymCounts)) {
+    const ymData   = allData.filter(r=>r.ym===ym);
+    const dates    = [...new Set(ymData.map(r=>r.date))];
+    const stores   = [...new Set(ymData.map(r=>r.store))];
+    const totalSal = ymData.reduce((s,r)=>s+r.sales, 0);
+    existMap[ym] = {ym, dates: dates.length, stores: stores.length, totalSales: totalSal, recordCount: ymData.length};
+  }
+  await idbPut('files', Object.values(existMap));
+
   updateFilters();
   updateDataRange();
   updateAll();
-  renderSessionFiles();
   toast(`${files.length}件のCSVを読み込みました（計${total}レコード）`);
 }
 
-function renderSessionFiles() {
-  const el = document.getElementById('session-files');
-  const entries = Object.entries(sessionFiles);
-  if (!entries.length) { el.innerHTML = ''; return; }
-  el.innerHTML = entries.map(([name, cnt]) =>
-    `<div class="file-item"><span>${name}</span><span class="file-badge">${cnt}件</span></div>`
-  ).join('');
+// ======== 月別一覧 & 選択削除 ========
+let selectedYms = new Set();
+
+async function renderMonthList() {
+  const filesMeta = (await idbGetAll('files')).sort((a,b)=>b.ym.localeCompare(a.ym));
+  const list      = document.getElementById('month-list');
+  const noMsg     = document.getElementById('no-data-msg');
+  const delBtn    = document.getElementById('btn-delete-selected');
+
+  if (!filesMeta.length) {
+    list.innerHTML = '';
+    noMsg.style.display = '';
+    delBtn.style.display = 'none';
+    return;
+  }
+  noMsg.style.display = 'none';
+
+  list.innerHTML = filesMeta.map(f => {
+    const label  = f.ym.replace(/^(\d{4})-(\d{2})$/,'$1年$2月');
+    const sales  = '¥' + Math.round(f.totalSales).toLocaleString('ja-JP');
+    const chk    = selectedYms.has(f.ym) ? 'checked' : '';
+    return `<div class="file-item" style="align-items:center;gap:10px">
+      <input type="checkbox" data-ym="${f.ym}" ${chk} style="width:15px;height:15px;cursor:pointer;accent-color:var(--bad)">
+      <div style="flex:1">
+        <span style="font-weight:500">${label}</span>
+        <span style="color:var(--text2);margin-left:10px;font-size:11px">${f.dates}日分 ・ ${f.stores}店舗 ・ ${sales}</span>
+      </div>
+      <button class="btn" style="font-size:11px;padding:4px 10px" onclick="deleteSingleYm('${f.ym}')">削除</button>
+    </div>`;
+  }).join('');
+
+  // チェックボックスイベント
+  list.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) selectedYms.add(cb.dataset.ym);
+      else            selectedYms.delete(cb.dataset.ym);
+      delBtn.style.display = selectedYms.size > 0 ? '' : 'none';
+    });
+  });
+  delBtn.style.display = selectedYms.size > 0 ? '' : 'none';
 }
 
-// ---- tabs ----
+async function deleteSingleYm(ym) {
+  if (!confirm(`${ym.replace(/^(\d{4})-(\d{2})$/,'$1年$2月')}のデータを削除しますか？`)) return;
+  await idbDeleteByYm(ym);
+  allData = allData.filter(r => r.ym !== ym);
+  selectedYms.delete(ym);
+  updateFilters(); updateDataRange(); updateAll();
+  toast(`${ym} のデータを削除しました`);
+}
+
+document.getElementById('btn-delete-selected').addEventListener('click', async () => {
+  if (!selectedYms.size) return;
+  const labels = [...selectedYms].map(y=>y.replace(/^(\d{4})-(\d{2})$/,'$1年$2月')).join('、');
+  if (!confirm(`${labels} のデータを削除しますか？`)) return;
+  for (const ym of selectedYms) {
+    await idbDeleteByYm(ym);
+    allData = allData.filter(r => r.ym !== ym);
+  }
+  selectedYms.clear();
+  updateFilters(); updateDataRange(); updateAll();
+  toast('選択した月のデータを削除しました');
+});
+
+// ======== tabs ========
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
   t.classList.add('active');
@@ -643,65 +761,77 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   updateAll();
 }));
 
-// ---- segs ----
 document.querySelectorAll('#trend-seg .seg-btn').forEach(s => s.addEventListener('click', () => {
   document.querySelectorAll('#trend-seg .seg-btn').forEach(x => x.classList.remove('active'));
-  s.classList.add('active');
-  trendMode = s.dataset.seg;
+  s.classList.add('active'); trendMode = s.dataset.seg;
   renderTrend(getFiltered());
 }));
 document.querySelectorAll('#store-seg .seg-btn').forEach(s => s.addEventListener('click', () => {
   document.querySelectorAll('#store-seg .seg-btn').forEach(x => x.classList.remove('active'));
-  s.classList.add('active');
-  storeMode = s.dataset.seg;
+  s.classList.add('active'); storeMode = s.dataset.seg;
   renderStore(getFiltered());
 }));
 
-// ---- filters ----
-document.getElementById('filter-division').addEventListener('change', () => { updateFilters(); updateAll(); });
+['filter-division'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => { updateFilters(); updateAll(); });
+});
 ['filter-store','filter-month','filter-dow'].forEach(id => {
   document.getElementById(id).addEventListener('change', updateAll);
 });
 
-// ---- file inputs ----
 ['csv-upload','csv-upload2'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', e => { if(e.target.files.length) handleFiles(Array.from(e.target.files)); e.target.value=''; });
 });
 
-// ---- drag & drop ----
 const zone = document.getElementById('upload-zone');
 if (zone) {
   ['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add('drag'); }));
   ['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove('drag'); }));
-  zone.addEventListener('drop', e => { const files = Array.from(e.dataTransfer.files).filter(f=>f.name.endsWith('.csv')); if(files.length) handleFiles(files); });
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('drag');
+    const files = Array.from(e.dataTransfer.files).filter(f=>f.name.endsWith('.csv'));
+    if (files.length) handleFiles(files);
+  });
 }
 
-// ---- load data/sales.json ----
-async function loadJSON() {
+// ======== 初期ロード ========
+async function init() {
+  await openIDB();
+
+  // 1. IndexedDBから保存済みデータを復元
+  const saved = await idbGetAll('records');
+  if (saved.length) {
+    allData = saved.map(r => ({...r, division: getDivision(r.store_code, r.gyotai)}));
+    updateFilters(); updateDataRange(); updateAll();
+    toast(`保存済みデータを復元しました（${saved.length}件）`);
+  }
+
+  // 2. data/sales.json（GitHub Pages上の基準データ）をロード
   try {
-    const res = await fetch('data/sales.json?_=' + Date.now());
-    if (!res.ok) throw new Error('not found');
+    const res  = await fetch('data/sales.json?_=' + Date.now());
+    if (!res.ok) throw new Error();
     const json = await res.json();
-    const records = (json.records || []).map(r => ({
-      ...r,
-      division: getDivision(r.store_code, r.gyotai)
-    }));
-    mergeRecords(records);
-    if (json.meta) {
-      const d = json.meta.generated_at ? new Date(json.meta.generated_at) : null;
-      if (d) document.getElementById('last-updated').textContent = '更新: ' + d.toLocaleDateString('ja-JP', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    const recs = (json.records||[]).map(r => ({...r, _id:`${r.date}_${r.store_code}`, division: getDivision(r.store_code, r.gyotai)}));
+    // 既にIDBに存在するレコードとマージ（IDB優先）
+    const idbIds = new Set(saved.map(r=>r._id));
+    const newRecs = recs.filter(r => !idbIds.has(r._id));
+    if (newRecs.length) {
+      mergeIntoAllData(newRecs);
+      updateFilters(); updateDataRange(); updateAll();
     }
-    updateFilters();
-    updateDataRange();
-    updateAll();
+    if (json.meta?.generated_at) {
+      const d = new Date(json.meta.generated_at);
+      document.getElementById('last-updated').textContent = '更新: ' + d.toLocaleDateString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    }
   } catch(e) {
-    document.getElementById('data-range').textContent = 'data/sales.json が見つかりません — CSVをアップロードしてください';
-    updateAll();
+    if (!saved.length) {
+      document.getElementById('data-range').textContent = 'CSVをアップロードしてください';
+    }
   }
 }
 
-loadJSON();
+init();
 </script>
 </body>
 </html>
