@@ -385,17 +385,20 @@ function getFiltered() {
   const store = document.getElementById('filter-store').value;
   const month = document.getElementById('filter-month').value;
   const dow   = document.getElementById('filter-dow').value;
+  const EXCLUDE = new Set(['本社','検証','直営統括共通','商品企画']);
   return allData.filter(r =>
     (!div   || r.division === div) &&
     (!store || r.store    === store) &&
     (!month || r.ym       === month) &&
-    (!dow   || r.dow_type === dow)
+    (!dow   || r.dow_type === dow) &&
+    !EXCLUDE.has(r.store)
   );
 }
 
 function updateFilters() {
   const div = document.getElementById('filter-division').value;
-  const stores = [...new Set(allData.filter(r => !div || r.division === div).map(r => r.store))].sort();
+  const EXCLUDE_STORES = new Set(['本社','検証','直営統括共通','商品企画']);
+  const stores = [...new Set(allData.filter(r => (!div || r.division === div) && !EXCLUDE_STORES.has(r.store)).map(r => r.store))].sort();
   const sSel = document.getElementById('filter-store');
   const curS = sSel.value;
   sSel.innerHTML = '<option value="">全店舗</option>' + stores.map(s => `<option value="${s}"${s===curS?' selected':''}>${s}</option>`).join('');
