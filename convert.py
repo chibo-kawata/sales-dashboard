@@ -10,9 +10,9 @@ ROOT = Path(__file__).parent.parent
 CSV_DIR = ROOT / "csv"
 OUT_FILE = ROOT / "data" / "sales.json"
 
-PRESIDENT_CODES = {'101','102','103','109','111','113','112'}
+PRESIDENT_CODES = {'101','102','103','109','111','113','112','034'}  # 第2営業部：ぷれじでんと系＋琥虎ノ門＋華恵比寿
 SUMI_CODES = {'704'}
-FOOD_COURT_CODES = {'702'}
+# ららぽーと甲子園(702)は第1営業部に統合
 
 def get_division(store_code, gyotai):
     if gyotai == '千房FC':
@@ -21,11 +21,9 @@ def get_division(store_code, gyotai):
         return 'IZAKAYA'
     if store_code in SUMI_CODES:
         return 'おでんすみ吉'
-    if store_code in FOOD_COURT_CODES:
-        return 'フードコート（ららぽーと甲子園）'
     if store_code in PRESIDENT_CODES:
-        return '直営ぷれじでんと'
-    return '直営ベーシック'
+        return '第2営業部'
+    return '第1営業部'
 
 def safe_float(v):
     try:
@@ -50,6 +48,7 @@ def parse_csv(path):
                 if not date:
                     continue
                 records.append({
+                    '_id': f'{date}_{sc}',
                     'date': date,
                     'ym': date[:7],
                     'dow': r.get('曜日', ''),

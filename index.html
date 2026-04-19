@@ -106,7 +106,7 @@ tr:hover td{background:var(--surface2)}
 <div class="header">
   <div class="header-left">
     <div class="logo">売上ダッシュボード</div>
-    <div class="data-range" id="data-range">読み込み中...</div>
+    <div class="data-range" id="data-range">起動中...</div>
   </div>
   <div class="header-right">
     <div id="last-updated" style="font-size:11px;color:var(--text2)"></div>
@@ -606,7 +606,8 @@ function updateAll() {
 function parseCSV(text) {
   const lines = text.replace(/
 /g,'
-').replace(//g,'
+').replace(/
+/g,'
 ').trim().split('
 ');
   if (!lines.length) return [];
@@ -668,17 +669,8 @@ async function handleFiles(files) {
     records.forEach(r => { ymCounts[r.ym] = (ymCounts[r.ym]||0) + 1; });
     total += records.length;
   }
-  // files storeに月別集計を保存
-  const existing = await idbGetAll('files');
-  const existMap = Object.fromEntries(existing.map(f=>[f.ym,f]));
-  for (const [ym, cnt] of Object.entries(ymCounts)) {
-    const ymData   = allData.filter(r=>r.ym===ym);
-    const dates    = [...new Set(ymData.map(r=>r.date))];
-    const stores   = [...new Set(ymData.map(r=>r.store))];
-    const totalSal = ymData.reduce((s,r)=>s+r.sales, 0);
-    existMap[ym] = {ym, dates: dates.length, stores: stores.length, totalSales: totalSal, recordCount: ymData.length};
-  }
-  await idbPut('files', Object.values(existMap));
+  // IDB files メタを再構築
+  if (idb) { try { await rebuildFilesMeta(); } catch(e) {} }
 
   updateFilters();
   updateDataRange();
@@ -797,38 +789,82 @@ if (zone) {
 
 // ======== 初期ロード ========
 async function init() {
-  await openIDB();
+  // IDB初期化（失敗してもフォールバック）
+  try { await openIDB(); } catch(e) { idb = null; console.warn('IDB unavailable', e); }
 
-  // 1. IndexedDBから保存済みデータを復元
-  const saved = await idbGetAll('records');
-  if (saved.length) {
-    allData = saved.map(r => ({...r, division: getDivision(r.store_code, r.gyotai)}));
-    updateFilters(); updateDataRange(); updateAll();
-    toast(`保存済みデータを復元しました（${saved.length}件）`);
+  let savedCount = 0;
+
+  // 1. IDBから保存済みデータを復元
+  if (idb) {
+    try {
+      const saved = await idbGetAll('records');
+      savedCount  = saved.length;
+      if (savedCount) {
+        allData = saved.map(r => ({...r, division: getDivision(r.store_code||'', r.gyotai||'')}));
+        updateFilters(); updateDataRange(); updateAll();
+        document.getElementById('data-range').title = `IDBから${savedCount}件を復元`;
+      }
+    } catch(e) { console.warn('IDB read error', e); }
   }
 
-  // 2. data/sales.json（GitHub Pages上の基準データ）をロード
+  // 2. data/sales.json を取得（GitHub Pages基準データ）
+  let jsonLoaded = false;
   try {
-    const res  = await fetch('data/sales.json?_=' + Date.now());
-    if (!res.ok) throw new Error();
+    const res = await fetch('data/sales.json?_=' + Date.now());
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const json = await res.json();
-    const recs = (json.records||[]).map(r => ({...r, _id:`${r.date}_${r.store_code}`, division: getDivision(r.store_code, r.gyotai)}));
-    // 既にIDBに存在するレコードとマージ（IDB優先）
-    const idbIds = new Set(saved.map(r=>r._id));
-    const newRecs = recs.filter(r => !idbIds.has(r._id));
-    if (newRecs.length) {
-      mergeIntoAllData(newRecs);
+    const recs = (json.records||[]).map(r => ({
+      ...r,
+      _id: `${r.date}_${r.store_code}`,
+      division: getDivision(r.store_code||'', r.gyotai||'')
+    }));
+    if (recs.length) {
+      // IBD保存済みレコードを優先し、未収録分だけマージ
+      const existIds = new Set(allData.map(r=>r._id));
+      const toAdd    = recs.filter(r => !existIds.has(r._id));
+      if (toAdd.length) {
+        mergeIntoAllData(toAdd);
+        // 新規レコードをIDBにも保存
+        if (idb) { try { await idbPut('records', toAdd); } catch(e) {} }
+      }
+      // IDBのfilesメタも更新
+      if (idb) { try { await rebuildFilesMeta(); } catch(e) {} }
       updateFilters(); updateDataRange(); updateAll();
+      jsonLoaded = true;
     }
     if (json.meta?.generated_at) {
       const d = new Date(json.meta.generated_at);
-      document.getElementById('last-updated').textContent = '更新: ' + d.toLocaleDateString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+      document.getElementById('last-updated').textContent =
+        '更新: ' + d.toLocaleDateString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
     }
   } catch(e) {
-    if (!saved.length) {
-      document.getElementById('data-range').textContent = 'CSVをアップロードしてください';
-    }
+    console.info('sales.json fetch failed:', e.message);
   }
+
+  // 3. 何もデータがない場合
+  if (!allData.length) {
+    document.getElementById('data-range').textContent = 'CSVをアップロードしてください';
+    updateAll();
+  }
+}
+
+// IDB files ストアを allData から再構築
+async function rebuildFilesMeta() {
+  if (!idb) return;
+  const ymMap = {};
+  allData.forEach(r => {
+    if (!r.ym) return;
+    if (!ymMap[r.ym]) ymMap[r.ym] = [];
+    ymMap[r.ym].push(r);
+  });
+  const entries = Object.entries(ymMap).map(([ym, rows]) => ({
+    ym,
+    dates:      [...new Set(rows.map(r=>r.date))].length,
+    stores:     [...new Set(rows.map(r=>r.store))].length,
+    totalSales: rows.reduce((s,r)=>s+r.sales, 0),
+    recordCount: rows.length,
+  }));
+  await idbPut('files', entries);
 }
 
 init();
