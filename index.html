@@ -404,7 +404,7 @@ function updateFilters() {
   const mSel = document.getElementById('filter-month');
   const curM = mSel.value;
   mSel.innerHTML = '<option value="">全期間</option>' + months.map(m => {
-    const label = m.replace(/^(\d{4})-(\d{2})$/, '$1年$2月');
+    const label = m.replace(/[\/-]/,'年').replace(/[\/-]/,'月');
     return `<option value="${m}"${m===curM?' selected':''}>${label}</option>`;
   }).join('');
 }
@@ -522,7 +522,7 @@ function weekKey(dateStr) {
 function renderSummary(data) {
   renderKPI(data);
   const agg    = aggregate(data, r => r.date);
-  const labels = agg.map(a => a.key.replace('2026/','').replace(/^0/,''));
+  const labels = agg.map(a => a.key.replace(/^\d{4}[\/]/,'').replace(/^0/,''));
   lineChart('chart-main', labels, [
     {label:'実績',data:agg.map(a=>a.sales),       borderColor:'#378ADD',backgroundColor:'rgba(55,138,221,0.07)',tension:0.3,fill:true, borderWidth:2},
     {label:'前年',data:agg.map(a=>a.sales_prev),  borderColor:'#B4B2A9',borderDash:[4,3],tension:0.3,fill:false,borderWidth:1.5},
@@ -543,9 +543,9 @@ function renderTrend(data) {
                 trendMode === 'weekly'  ? r => weekKey(r.date) : r => r.date;
   const agg    = aggregate(data, keyFn);
   const labels = agg.map(a => {
-    if (trendMode === 'monthly') return a.key.replace(/^\d{4}-/,'') + '月';
-    if (trendMode === 'weekly')  return a.key.replace(/^\d{4}-/,'').replace('-','/') + '週';
-    return a.key.replace(/^\d{4}\//,'').replace(/^0/,'');
+    if (trendMode === 'monthly') return a.key.replace(/^\d{4}[\/\-]/,'') + '月';
+    if (trendMode === 'weekly')  return a.key.replace(/^\d{4}\-/,'').replace('-','/') + '週';
+    return a.key.replace(/^\d{4}[\/]/,'').replace(/^0/,'');
   });
   document.getElementById('trend-title').textContent = {daily:'日次',weekly:'週次',monthly:'月次'}[trendMode] + '売上推移';
   lineChart('chart-trend', labels, [
@@ -696,7 +696,7 @@ async function renderMonthList() {
   noMsg.style.display = 'none';
 
   list.innerHTML = filesMeta.map(f => {
-    const label  = f.ym.replace(/^(\d{4})-(\d{2})$/,'$1年$2月');
+    const label  = f.ym.replace(/[\/-]/,'年').replace(/[\/-]/,'月');
     const sales  = '¥' + Math.round(f.totalSales).toLocaleString('ja-JP');
     const chk    = selectedYms.has(f.ym) ? 'checked' : '';
     return `<div class="file-item" style="align-items:center;gap:10px">
@@ -721,7 +721,7 @@ async function renderMonthList() {
 }
 
 async function deleteSingleYm(ym) {
-  if (!confirm(`${ym.replace(/^(\d{4})-(\d{2})$/,'$1年$2月')}のデータを削除しますか？`)) return;
+  if (!confirm(`${ym.replace(/[\/-]/,'年').replace(/[\/-]/,'月')}のデータを削除しますか？`)) return;
   await idbDeleteByYm(ym);
   allData = allData.filter(r => r.ym !== ym);
   selectedYms.delete(ym);
@@ -731,7 +731,7 @@ async function deleteSingleYm(ym) {
 
 document.getElementById('btn-delete-selected').addEventListener('click', async () => {
   if (!selectedYms.size) return;
-  const labels = [...selectedYms].map(y=>y.replace(/^(\d{4})-(\d{2})$/,'$1年$2月')).join('、');
+  const labels = [...selectedYms].map(y=>y.replace(/[\/-]/,'年').replace(/[\/-]/,'月')).join('、');
   if (!confirm(`${labels} のデータを削除しますか？`)) return;
   for (const ym of selectedYms) {
     await idbDeleteByYm(ym);
@@ -819,15 +819,16 @@ async function init() {
       division: getDivision(r.store_code||'', r.gyotai||'')
     }));
     if (recs.length) {
-      // IBD保存済みレコードを優先し、未収録分だけマージ
+      // IDB保存済みレコードを優先し、未収録分だけマージ
       const existIds = new Set(allData.map(r=>r._id));
       const toAdd    = recs.filter(r => !existIds.has(r._id));
       if (toAdd.length) {
         mergeIntoAllData(toAdd);
-        // 新規レコードをIDBにも保存
         if (idb) { try { await idbPut('records', toAdd); } catch(e) {} }
+      } else {
+        // 全件既存の場合でも allData に反映（IDBが空だった場合）
+        if (!allData.length) mergeIntoAllData(recs);
       }
-      // IDBのfilesメタも更新
       if (idb) { try { await rebuildFilesMeta(); } catch(e) {} }
       updateFilters(); updateDataRange(); updateAll();
       jsonLoaded = true;
